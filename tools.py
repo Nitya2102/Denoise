@@ -97,6 +97,66 @@ def handle_color_correction(image_b64: str, temperature: float = 0.0, tint: floa
     return {"image_b64": _pil_to_b64(result), "info": f"Color correction (temp={temperature:+.1f}, tint={tint:+.1f})"}
 
 
+def handle_color_grading(
+    image_b64: str,
+    preset: str = "cinematic",
+    intensity: float = 0.7,
+    warmth: float = 0.0,
+    saturation: float = 1.0,
+    contrast: float = 1.0,
+    lift: float = 0.0,
+    gamma: float = 1.0,
+) -> dict:
+    img = _b64_to_pil(image_b64).convert("RGB")
+    arr = np.array(img, dtype=np.float32) / 255.0
+
+    preset_key = (preset or "cinematic").lower()
+    intensity = float(np.clip(intensity, 0.0, 1.0))
+
+    looks = {
+        "cinematic": {"contrast": 1.15, "saturation": 0.88, "warmth": 0.08, "lift": -0.03, "gamma": 0.96},
+        "vivid": {"contrast": 1.10, "saturation": 1.22, "warmth": 0.02, "lift": 0.00, "gamma": 1.00},
+        "warm_film": {"contrast": 1.05, "saturation": 0.96, "warmth": 0.14, "lift": 0.03, "gamma": 0.98},
+        "soft_film": {"contrast": 0.92, "saturation": 0.90, "warmth": 0.03, "lift": 0.06, "gamma": 1.05},
+        "noir": {"contrast": 1.25, "saturation": 0.0, "warmth": 0.0, "lift": -0.08, "gamma": 0.92},
+    }
+    look = looks.get(preset_key, looks["cinematic"])
+
+    grade_contrast = 1.0 + (look["contrast"] - 1.0) * intensity + (contrast - 1.0) * intensity
+    grade_saturation = max(0.0, 1.0 + (look["saturation"] - 1.0) * intensity + (saturation - 1.0) * intensity)
+    grade_warmth = look["warmth"] * intensity + warmth * intensity
+    grade_lift = look["lift"] * intensity + lift * intensity
+    grade_gamma = max(0.2, look["gamma"] * (1.0 - intensity) + gamma * intensity)
+
+    # Contrast around mid-gray.
+    arr = (arr - 0.5) * grade_contrast + 0.5
+
+    # Basic split-toning: warm highlights, cool shadows.
+    highlights = np.clip((arr - 0.5) * 1.4 + 0.5, 0.0, 1.0)
+    shadows = np.clip((0.5 - arr) * 1.4 + 0.5, 0.0, 1.0)
+    arr[:, :, 0] += grade_warmth * 0.10 * highlights[:, :, 0]
+    arr[:, :, 2] -= grade_warmth * 0.10 * highlights[:, :, 2]
+    arr[:, :, 0] -= grade_warmth * 0.06 * shadows[:, :, 0]
+    arr[:, :, 2] += grade_warmth * 0.06 * shadows[:, :, 2]
+
+    # Lift/lower shadows and highlights a bit for a graded feel.
+    arr = np.clip(arr + grade_lift, 0.0, 1.0)
+
+    # Gamma adjustment.
+    arr = np.clip(arr, 0.0, 1.0) ** (1.0 / grade_gamma)
+
+    graded = Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8))
+    graded = ImageEnhance.Color(graded).enhance(grade_saturation)
+
+    return {
+        "image_b64": _pil_to_b64(graded),
+        "info": (
+            f"Color graded with {preset_key} look "
+            f"(intensity={intensity:.2f}, sat={grade_saturation:.2f}, contrast={grade_contrast:.2f})"
+        ),
+    }
+
+
 def handle_brightness(image_b64: str, factor: float = 1.2) -> dict:
     img = _b64_to_pil(image_b64)
     result = ImageEnhance.Brightness(img).enhance(factor)
@@ -183,6 +243,16 @@ def build_mcp_registry() -> MCPRegistry:
                 {"temperature": {"type": "number", "default": 0.0, "description": "-1=cool +1=warm"},
                  "tint": {"type": "number", "default": 0.0}},
                 handle_color_correction, tags=["color", "correction"]),
+
+        MCPTool("color_grading", "Apply a cinematic or stylized color grade",
+            {"preset": {"type": "string", "default": "cinematic", "description": "cinematic, vivid, warm_film, soft_film, noir"},
+             "intensity": {"type": "number", "default": 0.7},
+             "warmth": {"type": "number", "default": 0.0},
+             "saturation": {"type": "number", "default": 1.0},
+             "contrast": {"type": "number", "default": 1.0},
+             "lift": {"type": "number", "default": 0.0},
+             "gamma": {"type": "number", "default": 1.0}},
+            handle_color_grading, tags=["color", "grading", "creative"]),
         
         MCPTool("brightness", "Adjust image brightness",
                 {"factor": {"type": "number", "default": 1.2}},

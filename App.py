@@ -5,6 +5,9 @@ Gradio UI for the A2A + MCP Image Processing Agent PoC.
 import gradio as gr
 import time
 import json
+import base64
+import io
+import numpy as np
 from PIL import Image
 import os
 
@@ -19,6 +22,7 @@ orchestrator = ImageProcessingOrchestrator(registry)
 PRESET_GOALS = [
     "Enhance this photo for printing — improve quality, sharpness and colors",
     "Prepare this image for a dark/moody artistic look",
+    "Apply a cinematic color grade with richer mood and tone",
     "Make this image suitable for OCR text extraction (maximize contrast and clarity)",
     "Create a clean edge map for technical analysis",
     "Optimize this noisy low-light photograph",
@@ -26,6 +30,16 @@ PRESET_GOALS = [
     "Convert to grayscale and boost contrast for a classic look",
     "Clean and resize this image for use as a thumbnail (256x256)",
 ]
+
+
+def _pil_to_b64(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _b64_to_pil(b64: str) -> Image.Image:
+    return Image.open(io.BytesIO(base64.b64decode(b64)))
 
 # ─── CSS ──────────────────────────────────────────────────────────────────────
 CUSTOM_CSS = """
@@ -111,6 +125,88 @@ h1, h2, h3 { font-family: var(--mono) !important; }
     border: none !important;
     font-family: var(--mono) !important;
 }
+
+#compare-btn button {
+    background: #1f2937 !important;
+    color: #e5e7eb !important;
+    border: 1px solid #374151 !important;
+    font-family: var(--mono) !important;
+    opacity: 0.45;
+    transition: transform 160ms ease, opacity 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+
+#compare-btn button:hover:not(:disabled) {
+    opacity: 1;
+    transform: translateY(-1px);
+    border-color: #6b7280 !important;
+    background: #334155 !important;
+}
+
+#compare-btn button:disabled {
+    opacity: 0.32;
+    cursor: not-allowed;
+}
+
+#compare-modal {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 1000 !important;
+    align-items: center;
+    justify-content: center;
+    padding: 4vh 4vw !important;
+    background: rgba(4, 8, 16, 0.74) !important;
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    animation: compareFadeIn 180ms ease-out;
+}
+
+#compare-shell {
+    width: min(1220px, 92vw);
+    max-height: 88vh;
+    overflow: auto;
+    background: linear-gradient(180deg, rgba(18, 18, 26, 0.98), rgba(10, 10, 15, 0.98));
+    border: 1px solid rgba(124, 58, 237, 0.35);
+    border-radius: 22px;
+    box-shadow: 0 32px 90px rgba(0, 0, 0, 0.58);
+    padding: 18px;
+    transform-origin: center center;
+    animation: comparePop 180ms ease-out;
+}
+
+#compare-shell .compare-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 8px;
+}
+
+#compare-shell .compare-note {
+    color: var(--muted);
+    font-size: 0.88rem;
+    margin: 0 0 14px 0;
+}
+
+#compare-shell .compare-images {
+    gap: 14px;
+}
+
+#compare-shell .compare-image-wrap {
+    background: rgba(15, 23, 42, 0.72);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 10px;
+}
+
+@keyframes compareFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes comparePop {
+    from { opacity: 0; transform: scale(0.965) translateY(10px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
 """
 
 # ─── State helpers ─────────────────────────────────────────────────────────────
@@ -154,6 +250,28 @@ def format_exec_line(event: dict) -> str:
     return ""
 
 
+def _compare_state_from_images(original: Image.Image, output: Image.Image) -> dict:
+    return {
+        "input_image": np.array(original.convert("RGB")),
+        "output_image": np.array(output.convert("RGB")),
+    }
+
+
+def open_compare_modal(compare_state: dict | None):
+    if not compare_state:
+        return gr.update(visible=False), None, None
+
+    return (
+        gr.update(visible=True),
+        compare_state["input_image"],
+        compare_state["output_image"],
+    )
+
+
+def close_compare_modal():
+    return gr.update(visible=False)
+
+
 # ─── Main processing function ─────────────────────────────────────────────────
 
 def run_pipeline(image, goal):
@@ -164,6 +282,9 @@ def run_pipeline(image, goal):
             "No image provided.",
             "Upload an image to begin.",
             gr.update(visible=False),
+            gr.update(interactive=False),
+            gr.update(visible=False),
+            None,
         )
         return
 
@@ -174,6 +295,9 @@ def run_pipeline(image, goal):
     step_html = ""
     current_out = pil_img
     plan_visible = False
+    compare_state = None
+    compare_btn_update = gr.update(interactive=False)
+    compare_modal_update = gr.update(visible=False)
 
     steps_done = 0
     steps_total = 0
@@ -183,15 +307,27 @@ def run_pipeline(image, goal):
 
         if etype == "orchestrator_start":
             exec_text = f"Orchestrator started\n   Goal: {goal}\n\n"
-            yield (pil_img, current_out, plan_text, exec_text, "Planning...", gr.update(visible=False))
+            compare_state = None
+            compare_btn_update = gr.update(interactive=False)
+            compare_modal_update = gr.update(visible=False)
+            yield (
+                pil_img, current_out, plan_text, exec_text, "Planning...",
+                gr.update(visible=False), compare_btn_update, compare_modal_update, compare_state,
+            )
 
         elif etype == "planning":
             exec_text += "PlannerAgent -> analyzing image with Groq Vision LLM...\n"
-            yield (pil_img, current_out, plan_text, exec_text, "Planning ...", gr.update(visible=False))
+            yield (
+                pil_img, current_out, plan_text, exec_text, "Planning ...",
+                gr.update(visible=False), compare_btn_update, compare_modal_update, compare_state,
+            )
 
         elif etype == "planning_failed":
             exec_text += f"\n[ERROR] Planning failed: {event['error']}\n"
-            yield (pil_img, current_out, plan_text, exec_text, f"Planning failed: {event['error']}", gr.update(visible=False))
+            yield (
+                pil_img, current_out, plan_text, exec_text, f"Planning failed: {event['error']}",
+                gr.update(visible=False), compare_btn_update, compare_modal_update, compare_state,
+            )
 
         elif etype == "a2a_dispatch":
             plan = event["plan"]
@@ -231,7 +367,10 @@ def run_pipeline(image, goal):
             step_html += "</div>"
 
             plan_visible = True
-            yield (pil_img, current_out, plan_text, exec_text, f"Plan ready — {steps_total} steps", gr.update(visible=True, value=step_html))
+            yield (
+                pil_img, current_out, plan_text, exec_text, f"Plan ready — {steps_total} steps",
+                gr.update(visible=True, value=step_html), compare_btn_update, compare_modal_update, compare_state,
+            )
 
         elif etype == "plan_received":
             exec_text += f"ExecutorAgent received plan — {event['total_steps']} steps\n\n"
@@ -239,9 +378,11 @@ def run_pipeline(image, goal):
         elif etype == "step_start":
             line = format_exec_line(event)
             exec_text += line + "\n"
-            yield (pil_img, current_out, plan_text, exec_text,
-                   f"Running {event['step_name']} ({event['step_index']+1}/{steps_total})...",
-                   gr.update(visible=True, value=step_html))
+            yield (
+                pil_img, current_out, plan_text, exec_text,
+                f"Running {event['step_name']} ({event['step_index']+1}/{steps_total})...",
+                gr.update(visible=True, value=step_html), compare_btn_update, compare_modal_update, compare_state,
+            )
 
         elif etype == "step_done":
             steps_done += 1
@@ -258,23 +399,32 @@ def run_pipeline(image, goal):
                 '"step-card running"',
                 '"step-card done"', 1
             )
-            yield (pil_img, current_out, plan_text, exec_text,
-                   f"{steps_done}/{steps_total} steps done",
-                   gr.update(visible=True, value=step_html))
+            yield (
+                pil_img, current_out, plan_text, exec_text,
+                f"{steps_done}/{steps_total} steps done",
+                gr.update(visible=True, value=step_html), compare_btn_update, compare_modal_update, compare_state,
+            )
 
         elif etype == "step_failed":
             line = format_exec_line(event)
             exec_text += line + "\n\n"
-            yield (pil_img, current_out, plan_text, exec_text,
-                   f"Step failed: {event['step_name']}",
-                   gr.update(visible=True, value=step_html))
+            yield (
+                pil_img, current_out, plan_text, exec_text,
+                f"Step failed: {event['step_name']}",
+                gr.update(visible=True, value=step_html), compare_btn_update, compare_modal_update, compare_state,
+            )
 
-        elif etype == "complete":
+        elif etype in ("pipeline_complete", "complete"):
             current_out = event["image"]
             exec_text += format_exec_line(event)
-            yield (pil_img, current_out, plan_text, exec_text,
-                   f"Done! {event['total_steps']} steps completed.",
-                   gr.update(visible=True, value=step_html))
+            compare_state = _compare_state_from_images(pil_img, current_out)
+            compare_btn_update = gr.update(interactive=True)
+            compare_modal_update = gr.update(visible=False)
+            yield (
+                pil_img, current_out, plan_text, exec_text,
+                f"Done! {event['total_steps']} steps completed.",
+                gr.update(visible=True, value=step_html), compare_btn_update, compare_modal_update, compare_state,
+            )
 
 
 # ─── Gradio UI ─────────────────────────────────────────────────────────────────
@@ -294,7 +444,7 @@ def build_ui():
     with gr.Blocks(title="A2A+MCP Image Agent PoC") as demo:
         gr.HTML("""
         <div class="main-header">
-            <h1>IMAGE PROCESSING AGENT</h1>
+            <h1>AGENT PIXEL</h1>
             <p>
                 <span class="badge badge-a2a">A2A Protocol</span>
                 <span class="badge badge-mcp">MCP Tools</span>
@@ -335,6 +485,44 @@ def build_ui():
                 gr.Markdown("")
 
                 with gr.Row():
+                    gr.Column(scale=1)
+                    compare_btn = gr.Button(
+                        "Compare",
+                        interactive=False,
+                        variant="secondary",
+                        size="sm",
+                        elem_id="compare-btn",
+                    )
+
+                compare_state = gr.State(None)
+
+                compare_modal = gr.Column(visible=False, elem_id="compare-modal")
+                with compare_modal:
+                    with gr.Column(elem_id="compare-shell"):
+                        with gr.Row(elem_classes=["compare-header"]):
+                            gr.Markdown("### Compare last completed run")
+                            compare_close = gr.Button("Close", variant="secondary", size="sm")
+
+                        gr.Markdown(
+                            "The input image is on the left and the final output is on the right.",
+                            elem_classes=["compare-note"],
+                        )
+
+                        with gr.Row(elem_classes=["compare-images"]):
+                            with gr.Column(elem_classes=["compare-image-wrap"]):
+                                compare_input_preview = gr.Image(
+                                    label="Input image",
+                                    interactive=False,
+                                    height=380,
+                                )
+                            with gr.Column(elem_classes=["compare-image-wrap"]):
+                                compare_output_preview = gr.Image(
+                                    label="Output image",
+                                    interactive=False,
+                                    height=380,
+                                )
+
+                with gr.Row():
                     input_preview  = gr.Image(label="Original", height=200, interactive=False)
                     output_preview = gr.Image(label="Output (live)", height=200, interactive=False)
 
@@ -355,7 +543,28 @@ def build_ui():
         run_btn.click(
             fn=run_pipeline,
             inputs=[image_input, goal_input],
-            outputs=[input_preview, output_preview, plan_log, exec_log, status_text, step_cards],
+            outputs=[
+                input_preview,
+                output_preview,
+                plan_log,
+                exec_log,
+                status_text,
+                step_cards,
+                compare_btn,
+                compare_modal,
+                compare_state,
+            ],
+        )
+
+        compare_btn.click(
+            fn=open_compare_modal,
+            inputs=[compare_state],
+            outputs=[compare_modal, compare_input_preview, compare_output_preview],
+        )
+
+        compare_close.click(
+            fn=close_compare_modal,
+            outputs=[compare_modal],
         )
 
     return demo
