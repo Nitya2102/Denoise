@@ -444,11 +444,9 @@ def build_ui():
     with gr.Blocks(title="A2A+MCP Image Agent PoC") as demo:
         gr.HTML("""
         <div class="main-header">
-            <h1>AGENT PIXEL</h1>
+            <h1>AGENT Pels64</h1>
             <p>
-                <span class="badge badge-a2a">A2A Protocol</span>
-                <span class="badge badge-mcp">MCP Tools</span>
-                
+
             </p>
         </div>
         """)
@@ -473,7 +471,7 @@ def build_ui():
                             outputs=goal_input,
                         )
 
-                run_btn = gr.Button("Run Agent", variant="primary", size="lg")
+                run_btn = gr.Button("Run", variant="primary", size="lg")
                 status_text = gr.Textbox(label="Status", interactive=False, lines=1)
 
                 gr.HTML("<hr style='border-color:#1e1e2e;margin:12px 0'>")
